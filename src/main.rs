@@ -1,11 +1,12 @@
-use notify_rust::{Notification, Timeout};
+use anyhow::{bail, Context, Error, Result};
 use getopt::Opt;
-use anyhow::{Context, Result, Error, bail};
-use std::path::Path;
+use notify_rust::{Notification, Timeout};
 use std::fs;
+use std::path::Path;
+use std::process::exit;
 
 const VERSION: &str = "0.1";
-const PROGNAME: &str = "batsignal"; 
+const PROGNAME: &str = "batsignal";
 const POWER_SUPLY_DIR: &str = "/sys/class/power_supply";
 
 #[derive(Debug)]
@@ -15,7 +16,7 @@ enum BatteryState {
     Warning,
     Critical,
     Danger,
-    Full
+    Full,
 }
 
 #[derive(Debug)]
@@ -66,7 +67,7 @@ struct Settings {
     dangercmd: Option<String>,
     appname: String,
     icon: Option<String>,
-    notification_timeout: Timeout 
+    notification_timeout: Timeout,
 }
 
 impl Default for Settings {
@@ -92,7 +93,7 @@ impl Default for Settings {
             dangercmd: None,
             appname: PROGNAME.to_string(),
             icon: None,
-            notification_timeout: Timeout::Never
+            notification_timeout: Timeout::Never,
         }
     }
 }
@@ -101,36 +102,65 @@ impl Settings {
     fn validate(self) -> Result<Self> {
         macro_rules! rangeerror {
             ($var:expr, $hi:expr) => {
-                Err(Error::msg(format!("Option -{} must be between 0 and {}", $var, $hi)))
-            }
+                Err(Error::msg(format!(
+                    "Option -{} must be between 0 and {}",
+                    $var, $hi
+                )))
+            };
         }
 
         if let Some(warning) = self.warning {
-            if warning > 100 || warning < 0 { return rangeerror!("w", 100) }
+            if warning > 100 || warning < 0 {
+                return rangeerror!("w", 100);
+            }
         }
         if let Some(critical) = self.critical {
-            if critical > 100 || critical < 0 { return rangeerror!("c", 100) }
+            if critical > 100 || critical < 0 {
+                return rangeerror!("c", 100);
+            }
         }
         if let Some(full) = self.full {
-            if full > 100 || full < 0 { return rangeerror!("f", 100) }
-        }
-
-        if self.multiplier > 3600 || self.multiplier < 0 { return rangeerror!("m", 3600) }
-
-        if let (Some(warning), Some(critical)) = (self.warning, self.critical) {
-            if warning <= critical {
-                return Err(Error::msg("Warning level must be greater than critical"))
+            if full > 100 || full < 0 {
+                return rangeerror!("f", 100);
             }
         }
 
-        let mut vals = [("danger", self.danger), ("critical", self.critical), ("warning", self.warning), ("full", self.full)]
-            .into_iter()
-            .filter_map(|(name, opt)| if let Some(value) = opt { Some((name, value)) } else { None } );
+        if self.multiplier > 3600 || self.multiplier < 0 {
+            return rangeerror!("m", 3600);
+        }
 
+        if let (Some(warning), Some(critical)) = (self.warning, self.critical) {
+            if warning <= critical {
+                return Err(Error::msg("Warning level must be greater than critical"));
+            }
+        }
+
+        let mut vals = [
+            ("danger", self.danger),
+            ("critical", self.critical),
+            ("warning", self.warning),
+            ("full", self.full),
+        ]
+        .into_iter()
+        .filter_map(|(name, opt)| {
+            if let Some(value) = opt {
+                Some((name, value))
+            } else {
+                None
+            }
+        });
+
+        // We can safely unwrap here because the iterator is not empty
         let mut greatest = vals.next().unwrap();
         for v in vals {
-            if v.1 >= greatest.1 { greatest = v }
-            else { return Err(Error::msg(format!("{} must be greater than {}", v.0, greatest.0))) }
+            if v.1 >= greatest.1 {
+                greatest = v
+            } else {
+                return Err(Error::msg(format!(
+                    "{} must be greater than {}",
+                    v.0, greatest.0
+                )));
+            }
         }
 
         Ok(self)
@@ -139,7 +169,7 @@ impl Settings {
 
 fn print_help() {
     print!(
-    "Usage: {PROGNAME} [OPTIONS]\n\
+        "Usage: {PROGNAME} [OPTIONS]\n\
     \n\
     Sends battery level notifications.\n\
     \n\
@@ -170,7 +200,8 @@ fn print_help() {
     -a NAME        app NAME used in desktop notifications
                    (default: {PROGNAME})
     -I ICON        display specified ICON in notifications\n\
-    ")
+    "
+    )
 }
 
 fn print_version() {
@@ -178,9 +209,11 @@ fn print_version() {
 }
 
 fn handle_battery_names(settings: &mut Settings, battery_names: &str) -> Result<()> {
-    settings.batteries = battery_names.replace(" ","").split(",").map(|battery_name| {
-        Ok(Battery::new(battery_name)?)
-    }).collect::<Result<Vec<Battery>>>()?;
+    settings.batteries = battery_names
+        .replace(" ", "")
+        .split(",")
+        .map(|battery_name| Ok(Battery::new(battery_name)?))
+        .collect::<Result<Vec<Battery>>>()?;
 
     Ok(())
 }
@@ -192,29 +225,63 @@ fn parse_args() -> Result<Settings> {
     let mut opts = getopt::Parser::new(&args, "hvboiew:c:d:f:W:C:D:F:n:m:a:I:");
 
     loop {
-        match opts.next().transpose().with_context(|| "Failed to parse args")? {
+        match opts
+            .next()
+            .transpose()
+            .with_context(|| "Failed to parse args")?
+        {
             None => break,
             Some(opt) => match opt {
-                Opt('h', None) => { print_help(); break },
-                Opt('v', None) => { print_version(); break },
+                Opt('h', None) => {
+                    print_help();
+                    exit(0);
+                }
+                Opt('v', None) => {
+                    print_version();
+                    exit(0);
+                }
                 Opt('b', None) => settings.daemonize = true,
                 Opt('o', None) => settings.run_once = true,
                 Opt('i', None) => settings.battery_required = false,
-                Opt('w', Some(warning)) =>
-                    settings.warning = Some(warning.parse().with_context(|| "Error parsing argument for option w")?),
-                Opt('c', Some(critical)) =>
-                    settings.critical = Some(critical.parse().with_context(|| "Error parsing argument for option c")?),
-                Opt('d', Some(danger)) =>
-                    settings.danger = Some(danger.parse().with_context(|| "Error parsing argument for option d")?),
-                Opt('f', Some(full)) => 
-                    settings.full = Some(full.parse().with_context(|| "Error parsing argument for option f")?),
+                Opt('w', Some(warning)) => {
+                    settings.warning = Some(
+                        warning
+                            .parse()
+                            .with_context(|| "Error parsing argument for option w")?,
+                    )
+                }
+                Opt('c', Some(critical)) => {
+                    settings.critical = Some(
+                        critical
+                            .parse()
+                            .with_context(|| "Error parsing argument for option c")?,
+                    )
+                }
+                Opt('d', Some(danger)) => {
+                    settings.danger = Some(
+                        danger
+                            .parse()
+                            .with_context(|| "Error parsing argument for option d")?,
+                    )
+                }
+                Opt('f', Some(full)) => {
+                    settings.full = Some(
+                        full.parse()
+                            .with_context(|| "Error parsing argument for option f")?,
+                    )
+                }
                 Opt('W', Some(warningmsg)) => settings.warningmsg = warningmsg,
                 Opt('C', Some(criticalmsg)) => settings.criticalmsg = criticalmsg,
                 Opt('D', dangercmd) => settings.dangercmd = dangercmd,
                 Opt('F', Some(fullmsg)) => settings.fullmsg = fullmsg,
-                Opt('n', Some(battery_names)) => handle_battery_names(&mut settings, battery_names.as_str())?,
-                Opt('m', Some(multiplier)) =>
-                    settings.multiplier = multiplier.parse().with_context(|| "Error parsing argument for option m")?,
+                Opt('n', Some(battery_names)) => {
+                    handle_battery_names(&mut settings, battery_names.as_str())?
+                }
+                Opt('m', Some(multiplier)) => {
+                    settings.multiplier = multiplier
+                        .parse()
+                        .with_context(|| "Error parsing argument for option m")?
+                }
                 Opt('a', Some(appname)) => settings.appname = appname,
                 Opt('I', icon) => settings.icon = icon,
                 Opt('e', None) => settings.notification_timeout = Timeout::Default,
@@ -232,15 +299,19 @@ fn find_batteries() -> Result<Vec<Battery>> {
     for f in fs::read_dir(POWER_SUPLY_DIR)? {
         let f_path = f?.path();
 
-        if f_path.is_dir() && f_path.join("type").exists()
-            && fs::read_to_string(f_path.join("type"))?.contains("Battery") {
-
-                found_batteries.push(Battery::new(
-                        f_path
-                        .file_name()
-                        .ok_or(anyhow::Error::msg("Invalid file name"))?
-                        .to_str()
-                        .ok_or(anyhow::Error::msg("Failed to convert battery name to string"))?)?);
+        if f_path.is_dir()
+            && f_path.join("type").exists()
+            && fs::read_to_string(f_path.join("type"))?.contains("Battery")
+        {
+            found_batteries.push(Battery::new(
+                f_path
+                    .file_name()
+                    .ok_or(anyhow::Error::msg("Invalid file name"))?
+                    .to_str()
+                    .ok_or(anyhow::Error::msg(
+                        "Failed to convert battery name to string",
+                    ))?,
+            )?);
         }
     }
 
@@ -251,8 +322,7 @@ fn find_batteries() -> Result<Vec<Battery>> {
     }
 }
 
-fn update_batteries(batteries: &mut Vec<Battery>) {
-}
+fn update_batteries(batteries: &mut Vec<Battery>) {}
 
 fn main() -> Result<()> {
     let mut settings = parse_args()?.validate()?;
@@ -260,7 +330,8 @@ fn main() -> Result<()> {
         settings.batteries = find_batteries()?
     }
 
-    let batteries = settings.batteries
+    let batteries = settings
+        .batteries
         .iter()
         .map(|b| b.name.clone())
         .reduce(|accum: String, item: String| format!("{}, {}", accum, item))
