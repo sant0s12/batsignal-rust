@@ -1,5 +1,4 @@
 use notify_rust::{Notification, Timeout};
-use std::process::exit;
 use getopt::Opt;
 use anyhow::{Context, Result, Error, bail};
 use std::path::Path;
@@ -55,14 +54,14 @@ struct Settings {
 
     multiplier: i32,
 
-    warning: i32,
-    critical: i32,
-    danger: i32,
-    full: i32,
+    warning: Option<i32>,
+    critical: Option<i32>,
+    danger: Option<i32>,
+    full: Option<i32>,
 
-    warningmsg: Option<String>,
-    criticalmsg: Option<String>,
-    fullmsg: Option<String>,
+    warningmsg: String,
+    criticalmsg: String,
+    fullmsg: String,
 
     dangercmd: Option<String>,
     appname: String,
@@ -81,20 +80,60 @@ impl Default for Settings {
 
             multiplier: 0,
 
-            warning: 15,
-            critical: 5,
-            danger: 2,
-            full: 0,
+            warning: Some(15),
+            critical: Some(5),
+            danger: Some(2),
+            full: None,
 
-            warningmsg: Some("Battery is low".to_string()),
-            criticalmsg: Some("Battery is critically low".to_string()),
-            fullmsg: Some("Battery is full".to_string()),
+            warningmsg: "Battery is low".to_string(),
+            criticalmsg: "Battery is critically low".to_string(),
+            fullmsg: "Battery is full".to_string(),
 
             dangercmd: None,
             appname: PROGNAME.to_string(),
             icon: None,
             notification_timeout: Timeout::Never
         }
+    }
+}
+
+impl Settings {
+    fn validate(self) -> Result<Self> {
+        macro_rules! rangeerror {
+            ($var:expr, $hi:expr) => {
+                Err(Error::msg(format!("Option -{} must be between 0 and {}", $var, $hi)))
+            }
+        }
+
+        if let Some(warning) = self.warning {
+            if warning > 100 || warning < 0 { return rangeerror!("w", 100) }
+        }
+        if let Some(critical) = self.critical {
+            if critical > 100 || critical < 0 { return rangeerror!("c", 100) }
+        }
+        if let Some(full) = self.full {
+            if full > 100 || full < 0 { return rangeerror!("f", 100) }
+        }
+
+        if self.multiplier > 3600 || self.multiplier < 0 { return rangeerror!("m", 3600) }
+
+        if let (Some(warning), Some(critical)) = (self.warning, self.critical) {
+            if warning <= critical {
+                return Err(Error::msg("Warning level must be greater than critical"))
+            }
+        }
+
+        let mut vals = [("danger", self.danger), ("critical", self.critical), ("warning", self.warning), ("full", self.full)]
+            .into_iter()
+            .filter_map(|(name, opt)| if let Some(value) = opt { Some((name, value)) } else { None } );
+
+        let mut greatest = vals.next().unwrap();
+        for v in vals {
+            if v.1 >= greatest.1 { greatest = v }
+            else { return Err(Error::msg(format!("{} must be greater than {}", v.0, greatest.0))) }
+        }
+
+        Ok(self)
     }
 }
 
@@ -162,17 +201,17 @@ fn parse_args() -> Result<Settings> {
                 Opt('o', None) => settings.run_once = true,
                 Opt('i', None) => settings.battery_required = false,
                 Opt('w', Some(warning)) =>
-                    settings.warning = warning.parse().with_context(|| "Error parsing argument for option w")?,
+                    settings.warning = Some(warning.parse().with_context(|| "Error parsing argument for option w")?),
                 Opt('c', Some(critical)) =>
-                    settings.critical = critical.parse().with_context(|| "Error parsing argument for option c")?,
+                    settings.critical = Some(critical.parse().with_context(|| "Error parsing argument for option c")?),
                 Opt('d', Some(danger)) =>
-                    settings.danger = danger.parse().with_context(|| "Error parsing argument for option d")?,
+                    settings.danger = Some(danger.parse().with_context(|| "Error parsing argument for option d")?),
                 Opt('f', Some(full)) => 
-                    settings.full = full.parse().with_context(|| "Error parsing argument for option f")?,
-                Opt('W', warningmsg) => settings.warningmsg = warningmsg,
-                Opt('C', criticalmsg) => settings.criticalmsg = criticalmsg,
+                    settings.full = Some(full.parse().with_context(|| "Error parsing argument for option f")?),
+                Opt('W', Some(warningmsg)) => settings.warningmsg = warningmsg,
+                Opt('C', Some(criticalmsg)) => settings.criticalmsg = criticalmsg,
                 Opt('D', dangercmd) => settings.dangercmd = dangercmd,
-                Opt('F', fullmsg) => settings.fullmsg = fullmsg,
+                Opt('F', Some(fullmsg)) => settings.fullmsg = fullmsg,
                 Opt('n', Some(battery_names)) => handle_battery_names(&mut settings, battery_names.as_str())?,
                 Opt('m', Some(multiplier)) =>
                     settings.multiplier = multiplier.parse().with_context(|| "Error parsing argument for option m")?,
@@ -212,8 +251,11 @@ fn find_batteries() -> Result<Vec<Battery>> {
     }
 }
 
+fn update_batteries(batteries: &mut Vec<Battery>) {
+}
+
 fn main() -> Result<()> {
-    let mut settings = parse_args()?;
+    let mut settings = parse_args()?.validate()?;
     if settings.batteries.is_empty() {
         settings.batteries = find_batteries()?
     }
@@ -225,6 +267,14 @@ fn main() -> Result<()> {
         .unwrap(); // We can unwrap here because finding no batteries is already handled before
 
     println!("Using batteries {batteries}");
+
+    loop {
+        update_batteries(&mut settings.batteries);
+
+        if settings.run_once {
+            break;
+        }
+    }
 
     Ok(())
 }
