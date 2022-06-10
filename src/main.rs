@@ -3,15 +3,16 @@ use getopt::Opt;
 use notify_rust::{Notification, Timeout};
 use std::fs;
 use std::path::Path;
-use std::process::exit;
+use std::process::{exit, Command};
+use std::str::FromStr;
 
 const VERSION: &str = "0.1";
 const PROGNAME: &str = "batsignal";
 const POWER_SUPLY_DIR: &str = "/sys/class/power_supply";
 
-#[derive(Debug)]
-enum BatteryState {
-    AC,
+#[derive(Debug, PartialEq)]
+enum State {
+    Charging,
     Discharging,
     Warning,
     Critical,
@@ -19,11 +20,36 @@ enum BatteryState {
     Full,
 }
 
+#[derive(Debug, PartialEq)]
+enum BatteryStatus {
+    Unknown,
+    Charging,
+    Discharging,
+    NotCharging,
+    Full,
+}
+
+impl FromStr for BatteryStatus {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "Unknown" => Ok(BatteryStatus::Unknown),
+            "Charging" => Ok(BatteryStatus::Charging),
+            "Discharging" => Ok(BatteryStatus::Discharging),
+            "Not charging" => Ok(BatteryStatus::NotCharging),
+            "Full" => Ok(BatteryStatus::Full),
+            other => Err(Error::msg(format!(
+                "Failed to parse battery status, found {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Battery {
     name: String,
-    state: BatteryState,
-    level: i32,
+    status: BatteryStatus,
     energy_full: i32,
     energy_now: i32,
 }
@@ -31,11 +57,10 @@ struct Battery {
 impl Battery {
     fn new<S: Into<String>>(name: S) -> Result<Self> {
         let name = name.into();
-        if Path::new(format!("{POWER_SUPLY_DIR}/{name}").as_str()).exists() {
+        if Path::new(POWER_SUPLY_DIR).join(name.as_str()).exists() {
             Ok(Self {
                 name,
-                state: BatteryState::Discharging,
-                level: 0,
+                status: BatteryStatus::Discharging,
                 energy_full: 0,
                 energy_now: 0,
             })
@@ -322,7 +347,68 @@ fn find_batteries() -> Result<Vec<Battery>> {
     }
 }
 
-fn update_batteries(batteries: &mut Vec<Battery>) {}
+fn update_batteries(batteries: &mut Vec<Battery>) -> Result<()> {
+    for battery in batteries {
+        let path = Path::new(POWER_SUPLY_DIR).join(battery.name.as_str());
+        battery.energy_now = fs::read_to_string(path.join("energy_now"))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Error parsing energy_now for {}", battery.name))?;
+
+        battery.energy_full = fs::read_to_string(path.join("energy_full"))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Error parsing energy_full for {}", battery.name))?;
+
+        battery.status = fs::read_to_string(path.join("status"))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Error parsing status for {}", battery.name))?;
+    }
+
+    Ok(())
+}
+
+fn notify_cmd(settings: &Settings, state: &State, charge_percent: i32) -> Result<()> {
+    let mut notification = Notification::new()
+        .timeout(settings.notification_timeout)
+        .appname(settings.appname.as_str())
+        .finalize();
+
+    if settings.icon.is_some() {
+        notification = notification
+            .icon(settings.icon.clone().unwrap().as_str())
+            .finalize();
+    }
+
+    let summary: &str;
+    let body = format!("Battery level: {}%", charge_percent);
+    match state {
+        State::Warning => summary = settings.warningmsg.as_str(),
+        State::Critical => summary = settings.criticalmsg.as_str(),
+        State::Full => summary = settings.fullmsg.as_str(),
+        State::Danger => {
+            if settings.dangercmd.is_some() {
+                Command::new("sh")
+                    .arg(format!("-c {}", settings.dangercmd.clone().unwrap()))
+                    .spawn()
+                    .with_context(|| {
+                        format!("Failed to run {}", settings.dangercmd.clone().unwrap())
+                    })?;
+            }
+
+            return Ok(());
+        }
+        _ => return Ok(()),
+    }
+
+    notification
+        .body(body.as_str())
+        .summary(summary)
+        .show()
+        .with_context(|| "Failed to show notification")?;
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let mut settings = parse_args()?.validate()?;
@@ -339,8 +425,65 @@ fn main() -> Result<()> {
 
     println!("Using batteries {batteries}");
 
+    let mut charge: (f64, f64);
+    let mut charge_percent: i32;
+    let mut discharging: bool;
+    let mut state = State::Discharging;
+    let mut new_state: State;
+
     loop {
-        update_batteries(&mut settings.batteries);
+        update_batteries(&mut settings.batteries)?;
+
+        charge = settings
+            .batteries
+            .iter()
+            .map(|b| b.energy_now as f64)
+            .zip(settings.batteries.iter().map(|b| b.energy_full as f64))
+            .reduce(|accum, item| (accum.0 + item.0, accum.1 + item.1))
+            .unwrap();
+        charge_percent = (charge.0 / charge.1 * 100.0) as i32;
+
+        discharging = settings
+            .batteries
+            .iter()
+            .any(|b| b.status == BatteryStatus::Discharging);
+
+        if !discharging {
+            if settings.full.is_some() && charge_percent >= settings.full.unwrap() {
+                new_state = State::Full;
+            } else {
+                new_state = State::Charging;
+            }
+        } else {
+            new_state = [
+                (State::Discharging, Some(100)),
+                (State::Warning, settings.warning),
+                (State::Critical, settings.critical),
+                (State::Danger, settings.danger),
+            ]
+            .into_iter()
+            .filter_map(|(state, opt)| {
+                if let Some(level) = opt {
+                    Some((state, level))
+                } else {
+                    None
+                }
+            })
+            .reduce(|accum, item| {
+                if charge_percent <= item.1 && item.1 <= accum.1 {
+                    item
+                } else {
+                    accum
+                }
+            })
+            .unwrap()
+            .0;
+        }
+
+        if new_state != state {
+            notify_cmd(&settings, &new_state, charge_percent)?;
+            state = new_state;
+        }
 
         if settings.run_once {
             break;
