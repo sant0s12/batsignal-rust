@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Error, Result};
 use getopt::Opt;
-use notify_rust::{Notification, Timeout};
+use notify_rust::{Notification, Timeout, Urgency};
 use std::fs;
 use std::path::Path;
 use std::process::{exit, Command};
@@ -378,15 +378,20 @@ fn notify_cmd(settings: &Settings, state: &State, charge_percent: i32) -> Result
     }
 
     let summary: &str;
+    let mut urgency = Urgency::Normal;
     let body = format!("Battery level: {}%", charge_percent);
     match state {
         State::Warning => summary = settings.warningmsg.as_str(),
-        State::Critical => summary = settings.criticalmsg.as_str(),
+        State::Critical => {
+            summary = settings.criticalmsg.as_str();
+            urgency = Urgency::Critical;
+        }
         State::Full => summary = settings.fullmsg.as_str(),
         State::Danger => {
             if settings.dangercmd.is_some() {
                 Command::new("sh")
-                    .arg(format!("-c {}", settings.dangercmd.clone().unwrap()))
+                    .arg("-c")
+                    .arg(format!("{}", settings.dangercmd.clone().unwrap()))
                     .spawn()
                     .with_context(|| {
                         format!("Failed to run {}", settings.dangercmd.clone().unwrap())
@@ -401,6 +406,7 @@ fn notify_cmd(settings: &Settings, state: &State, charge_percent: i32) -> Result
     notification
         .body(body.as_str())
         .summary(summary)
+        .urgency(urgency)
         .show()
         .with_context(|| "Failed to show notification")?;
     Ok(())
