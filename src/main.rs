@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{exit, Command};
 use std::str::FromStr;
+use std::{thread, time};
 
 const VERSION: &str = "0.1";
 const PROGNAME: &str = "batsignal";
@@ -74,11 +75,10 @@ impl Battery {
 struct Settings {
     daemonize: bool,
     run_once: bool,
-    battery_required: bool,
 
     batteries: Vec<Battery>,
 
-    multiplier: i32,
+    sleep_interval: i32,
 
     warning: Option<i32>,
     critical: Option<i32>,
@@ -100,11 +100,10 @@ impl Default for Settings {
         Self {
             daemonize: true,
             run_once: false,
-            battery_required: true,
 
             batteries: Vec::new(),
 
-            multiplier: 0,
+            sleep_interval: 60,
 
             warning: Some(15),
             critical: Some(5),
@@ -150,8 +149,8 @@ impl Settings {
             }
         }
 
-        if self.multiplier > 3600 || self.multiplier < 0 {
-            return rangeerror!("m", 3600);
+        if self.sleep_interval < 0 {
+            return rangeerror!("m", i32::MAX / 1000);
         }
 
         if let (Some(warning), Some(critical)) = (self.warning, self.critical) {
@@ -203,7 +202,6 @@ fn print_help() {
     -v             print program version information
     -b             run as background daemon
     -o             check battery once and exit
-    -i             ignore missing battery errors
     -e             cause notifications to expire
     -w LEVEL       battery warning LEVEL
                    (default: 15)
@@ -219,8 +217,7 @@ fn print_help() {
     -F MESSAGE     show MESSAGE when battery is full
     -n NAME        use battery NAME - multiple batteries separated by commas
                    (default: BAT0)
-    -m SECONDS     minimum number of SECONDS to wait between battery checks
-                   0 SECONDS disables polling and waits for USR1 signal
+    -s SECONDS     number of SECONDS to wait between battery checks
                    (default: 60)
     -a NAME        app NAME used in desktop notifications
                    (default: {PROGNAME})
@@ -247,7 +244,7 @@ fn parse_args() -> Result<Settings> {
     let mut settings = Settings::default();
 
     let args: Vec<String> = std::env::args().collect();
-    let mut opts = getopt::Parser::new(&args, "hvboiew:c:d:f:W:C:D:F:n:m:a:I:");
+    let mut opts = getopt::Parser::new(&args, "hvboew:c:d:f:W:C:D:F:n:s:a:I:");
 
     loop {
         match opts
@@ -267,7 +264,6 @@ fn parse_args() -> Result<Settings> {
                 }
                 Opt('b', None) => settings.daemonize = true,
                 Opt('o', None) => settings.run_once = true,
-                Opt('i', None) => settings.battery_required = false,
                 Opt('w', Some(warning)) => {
                     settings.warning = Some(
                         warning
@@ -302,8 +298,8 @@ fn parse_args() -> Result<Settings> {
                 Opt('n', Some(battery_names)) => {
                     handle_battery_names(&mut settings, battery_names.as_str())?
                 }
-                Opt('m', Some(multiplier)) => {
-                    settings.multiplier = multiplier
+                Opt('s', Some(sleep_interval)) => {
+                    settings.sleep_interval = sleep_interval
                         .parse()
                         .with_context(|| "Error parsing argument for option m")?
                 }
@@ -487,6 +483,8 @@ fn main() -> Result<()> {
 
         if settings.run_once {
             break;
+        } else {
+            thread::sleep(time::Duration::from_secs(settings.sleep_interval as u64));
         }
     }
 
