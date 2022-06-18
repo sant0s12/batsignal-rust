@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Error, Result};
+pub(crate) use anyhow::{bail, Context, Error, Result};
 use getopt::Opt;
 use notify_rust::{Notification, Timeout, Urgency};
 use std::fs;
@@ -134,17 +134,17 @@ impl Settings {
         }
 
         if let Some(warning) = self.warning {
-            if warning > 100 || warning < 0 {
+            if !(0..=100).contains(&warning) {
                 return rangeerror!("w", 100);
             }
         }
         if let Some(critical) = self.critical {
-            if critical > 100 || critical < 0 {
+            if !(0..=100).contains(&critical) {
                 return rangeerror!("c", 100);
             }
         }
         if let Some(full) = self.full {
-            if full > 100 || full < 0 {
+            if !(0..=100).contains(&full) {
                 return rangeerror!("f", 100);
             }
         }
@@ -166,13 +166,7 @@ impl Settings {
             ("full", self.full),
         ]
         .into_iter()
-        .filter_map(|(name, opt)| {
-            if let Some(value) = opt {
-                Some((name, value))
-            } else {
-                None
-            }
-        });
+        .filter_map(|(name, opt)| opt.map(|value| (name, value)));
 
         // We can safely unwrap here because the iterator is not empty
         let mut greatest = vals.next().unwrap();
@@ -232,9 +226,9 @@ fn print_version() {
 
 fn handle_battery_names(settings: &mut Settings, battery_names: &str) -> Result<()> {
     settings.batteries = battery_names
-        .replace(" ", "")
-        .split(",")
-        .map(|battery_name| Ok(Battery::new(battery_name)?))
+        .replace(' ', "")
+        .split(',')
+        .map(Battery::new)
         .collect::<Result<Vec<Battery>>>()?;
 
     Ok(())
@@ -327,11 +321,11 @@ fn find_batteries() -> Result<Vec<Battery>> {
             found_batteries.push(Battery::new(
                 f_path
                     .file_name()
-                    .ok_or(anyhow::Error::msg("Invalid file name"))?
+                    .ok_or_else(|| anyhow::Error::msg("Invalid file name"))?
                     .to_str()
-                    .ok_or(anyhow::Error::msg(
-                        "Failed to convert battery name to string",
-                    ))?,
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("Failed to convert battery name to string")
+                    })?,
             )?);
         }
     }
@@ -391,7 +385,7 @@ fn notify_cmd(settings: &Settings, state: &State, charge_percent: i32) -> Result
             if settings.dangercmd.is_some() {
                 Command::new("sh")
                     .arg("-c")
-                    .arg(format!("{}", settings.dangercmd.clone().unwrap()))
+                    .arg(settings.dangercmd.as_ref().unwrap())
                     .spawn()
                     .with_context(|| {
                         format!("Failed to run {}", settings.dangercmd.clone().unwrap())
@@ -464,13 +458,7 @@ fn main() -> Result<()> {
                 (State::Danger, settings.danger),
             ]
             .into_iter()
-            .filter_map(|(state, opt)| {
-                if let Some(level) = opt {
-                    Some((state, level))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(state, opt)| opt.map(|level| (state, level)))
             .reduce(|accum, item| {
                 if charge_percent <= item.1 && item.1 <= accum.1 {
                     item
